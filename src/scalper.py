@@ -28,7 +28,7 @@ class Scalper:
         except  Exception as e:
             logging.error("Failed to initialize configuration from file " + config_file, e)
     
-    def get_option_greeks(self):
+    async def get_option_greeks(self):
         delta = float(self.exchange.fetch_balance({'currency': str(self.symbol)})['info']['options_delta'])
         gamma = float(self.exchange.fetch_balance({'currency': str(self.symbol)})['info']['options_gamma'])
         return delta, gamma
@@ -48,13 +48,14 @@ class Scalper:
     async def delta_hedge(self):
         bids, asks = self.get_order_book(self.hedge_contract)
         open_orders = self.get_open_orders(self.hedge_contract)
-        option_delta, option_gamma = self.get_option_delta()
+        option_delta, option_gamma = self.get_option_greeks()
         hedge_delta = self.get_hedge_delta()
-        atm_delta = hedge_delta - option_delta
+        atm_delta = hedge_delta + option_delta
 
-        # First hedge atm delta
-        # Second create a ladder of bid price, bid amount and ask price, ask amount based on self.price_move decrements/increments
-        # use delta + self.price_move * gamma 
+        # Create a ladder for hedge instrument (future/swap) 
+        # of bid price, bid amount and ask price, ask amount based on self.price_move decrements/increments
+        #
+        # use (atm_delta + multiplier * self.price_move * gamma) * (spot price + multiplier * self.price_move)
         # replace open orders with new ladder
 
     async def get_balance(self, symbol):
