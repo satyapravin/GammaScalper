@@ -51,7 +51,12 @@ class Scalper:
         option_delta, option_gamma = self.get_option_delta()
         hedge_delta = self.get_hedge_delta()
         atm_delta = hedge_delta - option_delta
-        
+
+        # First hedge atm delta
+        # Second create a ladder of bid price, bid amount and ask price, ask amount based on self.price_move decrements/increments
+        # use delta + self.price_move * gamma 
+        # replace open orders with new ladder
+
     async def get_balance(self, symbol):
         return self.exchange.fetch_balance({'currency': self.symbol})
 
