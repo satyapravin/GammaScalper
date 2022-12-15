@@ -2,8 +2,9 @@ import asyncio
 import ccxt
 import configparser
 import logging
+import opstrat as op
+import requests
 import time
-
 
 class Scalper:
     def __init__(self, config_file, exchange):
@@ -13,10 +14,12 @@ class Scalper:
             self._api_key = cfg[exchange]['api_key']
             self._api_secret = cfg[exchange]['api_secret']
             self.symbol = cfg[exchange]['symbol']
-            self.price_move = float(cfg[exchange]['price_move'])
+            self.price_move = round(float(cfg[exchange]['price_move']), 2)
             self.hedge_lookup = cfg[exchange]['hedge_lookup']
             self.hedge_contract = cfg[exchange]['hedge_contract']
             self.ladder_size = int(cfg[exchange]['ladder_size'])
+            self.tick_size = round(float(cfg[exchange]['tick_size']), 2)
+            self.delta_threshold = float(cfg[exchange]['delta_threshold'])
             self.done = False
             if exchange == "Deribit":
                 self.exchange = ccxt.deribit({'apiKey': self._api_key, 'secret': self._api_secret})
@@ -41,8 +44,9 @@ class Scalper:
         return self.exchange.fetch_open_orders(symbol)
 
     async def get_ticker(self, symbol):
-        ticker = self.exchange.fetch_ticker(symbol)
-        return ticker["bid"], ticker["ask"]
+        ticker = self.exchange.publicGetTicker({"instrument_name": symbol})
+        ticker = ticker['result']
+        return float(ticker["best_bid_price"]), float(ticker["best_ask_price"]), float(ticker['mark_price'])
 
     async def get_order_book(self, symbol):
         orderbook = self.exchange.fetch_l2_order_book(symbol, 40)
@@ -51,82 +55,100 @@ class Scalper:
         return bids, asks
 
 
-    async def get_new_delta(self, hedge_delta, option_delta, option_gamma, move):
-        return hedge_delta + option_delta * (1 + option_gamma * move)
+    async def get_new_delta(self, net_delta, option_gamma, move):
+        return net_delta + option_gamma * move
 
-    async def delta_hedge(self):
+    async def delta_hedge(self, prev_index, prev_delta):
         # get greeks
         option_delta, option_gamma = await self.get_option_greeks()
         hedge_delta = await self.get_hedge_delta()
-        
-        self.exchange.cancel_all_orders(self.hedge_contract)
+        net_delta = option_delta + hedge_delta
 
         proposed_bids = {}
         proposed_asks = {}
+        best_bid_price, best_ask_price, mark_price = await self.get_ticker(self.hedge_contract)
+        index_price = (best_ask_price + best_bid_price) * 0.5
+        net_delta = await self.get_new_delta(net_delta, option_gamma, index_price - mark_price)
+        
+        if index_price == prev_index or abs(prev_delta - net_delta) / abs(prev_delta) < 0.33:
+            return index_price, prev_delta
 
-        # compute new ladder to publish
-        bid_price, ask_price = await self.get_ticker(self.hedge_contract)
+        self.exchange.cancel_all_orders(self.hedge_contract)
 
-        print("bid price", bid_price, "ask price", ask_price)
-        print("option delta", option_delta, "hedge delta", hedge_delta, "option gamma", option_gamma)
-
+        print("bid price", best_bid_price, "ask price", best_ask_price, "mark price", mark_price)
+        print("delta", round(net_delta, 4), "option delta", round(option_delta, 4), "hedge delta", round(hedge_delta, 4))
+        
         net_bid_delta = 0
         net_ask_delta = 0        
         
-        first_bid_price = bid_price - self.price_move
-        bdelta = await self.get_new_delta(hedge_delta, option_delta, option_gamma, -self.price_move)
+        for ladder in range(self.ladder_size):
+            bid_price_delta = self.price_move * ladder
 
-        if bdelta < 0:
-            proposed_bids[first_bid_price] = abs(bdelta) * first_bid_price
-            net_bid_delta = bdelta
+            if net_delta > 0:
+                ask_price_delta = bid_price_delta
+                bid_price_delta -= 2
+            else:
+                ask_price_delta = bid_price_delta + 2
 
-        first_ask_price = ask_price + self.price_move
-        adelta = await self.get_new_delta(hedge_delta, option_delta, option_gamma, self.price_move)
-        
-        if adelta > 0:
-            proposed_asks[first_ask_price] = adelta * first_ask_price
-            net_ask_delta = adelta
+            new_bid_price = round(round((best_bid_price - bid_price_delta) / self.tick_size) * self.tick_size, 2)
+            bdelta = await self.get_new_delta(net_delta, option_gamma, new_bid_price - best_bid_price) - net_bid_delta
 
-        for ladder in range(1, self.ladder_size):
-            price_delta = self.price_move * (2**ladder)
-            new_bid_price = bid_price - price_delta
-            bdelta = await self.get_new_delta(hedge_delta, option_delta, option_gamma, -price_delta) - net_bid_delta
-
-            if bdelta < 0:
-                proposed_bids[new_bid_price] = abs(bdelta) * new_bid_price
+            if bdelta * new_bid_price < -1 and abs(bdelta) > self.delta_threshold:
+                proposed_bids[new_bid_price] = round(abs(bdelta) * new_bid_price, 0)
                 net_bid_delta += bdelta
 
-            new_ask_price = ask_price - price_delta
-            adelta = await self.get_new_delta(hedge_delta, option_delta, option_gamma, price_delta) - net_ask_delta
-            if adelta > 0:
-                proposed_asks[new_ask_price] = adelta * new_ask_price
+            new_ask_price = round(round((best_ask_price + ask_price_delta) / self.tick_size) * self.tick_size, 2)
+            adelta = await self.get_new_delta(net_delta, option_gamma, new_ask_price - best_ask_price) - net_ask_delta
+            if adelta * new_ask_price > 1 and abs(adelta) > self.delta_threshold:
+                proposed_asks[new_ask_price] = round(adelta * new_ask_price, 0)
                 net_ask_delta += adelta
 
         # submit orders
         for bid_price in proposed_bids:
-            print("bid", bid_price, proposed_bids[bid_price])
-            #self.exchange.create_post_only_order(self.hedge_contract, 'limit', "buy", proposed_bids[bid_price], {"post_only": True})
+            print("bid_ladder", bid_price, round(proposed_bids[bid_price]))
+            self.exchange.create_limit_buy_order(self.hedge_contract, proposed_bids[bid_price], bid_price, {"post_only": True})
 
         for ask_price in proposed_asks:
-            print("ask", ask_price, proposed_asks[ask_price])
-            #self.exchange.create_post_only_order(self.hedge_contract, 'limit', "sell", proposed_asks[ask_price], {"post_only": True})
+            print("ask_ladder", ask_price, round(proposed_asks[ask_price]))
+            self.exchange.create_limit_sell_order(self.hedge_contract, proposed_asks[ask_price], ask_price, {"post_only": True})
+        
+        print("====================================")
+        return index_price, net_delta
 
-       
     async def get_balance(self, symbol):
         return self.exchange.fetch_balance({'currency': self.symbol})
 
     async def run_loop(self):
         retry_count = 10
+        post_interval = 0
+        index_price = 0
+        prev_delta = 1
         while not self.done:
             try:
-                self.delta_hedge()
-                time.sleep(5)
+                index_price, prev_delta = await self.delta_hedge(index_price, prev_delta)
+                time.sleep(3)
+                post_interval += 3
+
+                if post_interval > 300:
+                    await self.send_to_telegram()
+                    post_interval = 0
                 retry_count = 0
             except Exception as e:
                 logging.error("Hedge failed", e)
                 retry_count += 1
                 if retry_count >= 9:
                     self.done = True
+
+    async def send_to_telegram(self):
+        apiToken = '5715880531:AAEX0uW87-SHHTGtG6Wh0wJ3z140nm0l5hU'
+        apiURL = f'https://api.telegram.org/bot{apiToken}/sendMessage'
+        chatID = '1182531369'
+
+        try:
+            message = self.exchange.fetch_balance({'currency': str(self.symbol)})['info']
+            requests.post(apiURL, json={'chat_id': chatID, 'text': message})
+        except Exception as e:
+            print("telegram error", e)
 
     def run(self):
         self.done = False
