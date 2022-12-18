@@ -38,7 +38,8 @@ class Scalper:
         return delta, gamma
 
     async def get_hedge_delta(self):
-        return float(self.exchange.fetch_balance({'currency': str(self.symbol)})['info']['delta_total_map'][self.hedge_lookup])
+        lookup = self.exchange.fetch_balance({'currency': str(self.symbol)})
+        return float(lookup['info']['delta_total_map'][self.hedge_lookup])
 
     async def get_open_orders(self, symbol):
         return self.exchange.fetch_open_orders(symbol)
@@ -55,8 +56,8 @@ class Scalper:
         return bids, asks
 
 
-    async def get_new_delta(self, net_delta, option_gamma, move):
-        return net_delta + option_gamma * move
+    async def get_new_delta(self, net_delta, option_gamma, move, index):
+        return net_delta + option_gamma * move 
 
     async def delta_hedge(self, prev_index, prev_delta):
         # get greeks
@@ -68,10 +69,14 @@ class Scalper:
         proposed_asks = {}
         best_bid_price, best_ask_price, mark_price = await self.get_ticker(self.hedge_contract)
         index_price = (best_ask_price + best_bid_price) * 0.5
-        net_delta = await self.get_new_delta(net_delta, option_gamma, index_price - mark_price)
-        
-        if index_price == prev_index or abs(prev_delta - net_delta) / abs(prev_delta) < 0.33:
+        net_delta = await self.get_new_delta(net_delta, option_gamma, index_price - mark_price, mark_price)
+
+        if index_price == prev_index and abs(net_delta - prev_delta) > self.delta_threshold:
             return index_price, prev_delta
+    
+        if abs(net_delta) < self.delta_threshold:
+            print("not need to hedge")
+            return index_price, net_delta
 
         self.exchange.cancel_all_orders(self.hedge_contract)
 
@@ -83,33 +88,31 @@ class Scalper:
         
         for ladder in range(self.ladder_size):
             bid_price_delta = self.price_move * ladder
-
-            if net_delta > 0:
-                ask_price_delta = bid_price_delta
-                bid_price_delta -= 2
-            else:
-                ask_price_delta = bid_price_delta + 2
+            ask_price_delta = bid_price_delta
 
             new_bid_price = round(round((best_bid_price - bid_price_delta) / self.tick_size) * self.tick_size, 2)
-            bdelta = await self.get_new_delta(net_delta, option_gamma, new_bid_price - best_bid_price) - net_bid_delta
-
-            if bdelta * new_bid_price < -1 and abs(bdelta) > self.delta_threshold:
+            bdelta = await self.get_new_delta(net_delta, option_gamma, new_bid_price - best_bid_price, best_bid_price) - net_bid_delta
+            
+            if bdelta * new_bid_price < -25:
+                print("bid ladder", ladder, new_bid_price, abs(bdelta) * new_bid_price)
                 proposed_bids[new_bid_price] = round(abs(bdelta) * new_bid_price, 0)
                 net_bid_delta += bdelta
 
             new_ask_price = round(round((best_ask_price + ask_price_delta) / self.tick_size) * self.tick_size, 2)
-            adelta = await self.get_new_delta(net_delta, option_gamma, new_ask_price - best_ask_price) - net_ask_delta
-            if adelta * new_ask_price > 1 and abs(adelta) > self.delta_threshold:
+            adelta = await self.get_new_delta(net_delta, option_gamma, new_ask_price - best_ask_price, best_ask_price) - net_ask_delta
+            
+            if adelta * new_ask_price > 25:
+                print("ask ladder", ladder, new_ask_price, adelta * new_ask_price)
                 proposed_asks[new_ask_price] = round(adelta * new_ask_price, 0)
                 net_ask_delta += adelta
 
         # submit orders
         for bid_price in proposed_bids:
-            print("bid_ladder", bid_price, round(proposed_bids[bid_price]))
+            print("bid_ladder", bid_price, proposed_bids[bid_price])
             self.exchange.create_limit_buy_order(self.hedge_contract, proposed_bids[bid_price], bid_price, {"post_only": True})
 
         for ask_price in proposed_asks:
-            print("ask_ladder", ask_price, round(proposed_asks[ask_price]))
+            print("ask_ladder", ask_price, proposed_asks[ask_price])
             self.exchange.create_limit_sell_order(self.hedge_contract, proposed_asks[ask_price], ask_price, {"post_only": True})
         
         print("====================================")
@@ -119,7 +122,7 @@ class Scalper:
         return self.exchange.fetch_balance({'currency': self.symbol})
 
     async def run_loop(self):
-        retry_count = 10
+        retry_count = 0
         post_interval = 0
         index_price = 0
         prev_delta = 1
@@ -134,7 +137,7 @@ class Scalper:
                     post_interval = 0
                 retry_count = 0
             except Exception as e:
-                logging.error("Hedge failed", e)
+                print("Hedge failed", e.args)
                 retry_count += 1
                 if retry_count >= 9:
                     self.done = True
