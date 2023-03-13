@@ -2,7 +2,6 @@ import asyncio
 import ccxt
 import configparser
 import logging
-import opstrat as op
 import requests
 import time
 
@@ -23,6 +22,7 @@ class Scalper:
             self.done = False
             if exchange == "Deribit":
                 self.exchange = ccxt.deribit({'apiKey': self._api_key, 'secret': self._api_secret})
+                self.exchange.set_sandbox_mode(True)
             else:
                 raise Exception("Exchange " + exchange + " not yet supported")
 
@@ -56,7 +56,7 @@ class Scalper:
         return bids, asks
 
 
-    async def get_new_delta(self, net_delta, option_gamma, move, index):
+    async def get_new_delta(self, net_delta, option_gamma, move):
         return net_delta + option_gamma * move 
 
     async def delta_hedge(self, prev_index, prev_delta):
@@ -69,7 +69,6 @@ class Scalper:
         proposed_asks = {}
         best_bid_price, best_ask_price, mark_price = await self.get_ticker(self.hedge_contract)
         index_price = (best_ask_price + best_bid_price) * 0.5
-        net_delta = await self.get_new_delta(net_delta, option_gamma, index_price - mark_price, mark_price)
 
         if index_price == prev_index and abs(net_delta - prev_delta) > self.delta_threshold:
             return index_price, prev_delta
@@ -91,17 +90,17 @@ class Scalper:
             ask_price_delta = bid_price_delta
 
             new_bid_price = round(round((best_bid_price - bid_price_delta) / self.tick_size) * self.tick_size, 2)
-            bdelta = await self.get_new_delta(net_delta, option_gamma, new_bid_price - best_bid_price, best_bid_price) - net_bid_delta
+            bdelta = await self.get_new_delta(net_delta, option_gamma, new_bid_price - best_bid_price) - net_bid_delta
             
-            if bdelta * new_bid_price < -25:
+            if bdelta * new_bid_price < -50:
                 print("bid ladder", ladder, new_bid_price, abs(bdelta) * new_bid_price)
                 proposed_bids[new_bid_price] = round(abs(bdelta) * new_bid_price, 0)
                 net_bid_delta += bdelta
 
             new_ask_price = round(round((best_ask_price + ask_price_delta) / self.tick_size) * self.tick_size, 2)
-            adelta = await self.get_new_delta(net_delta, option_gamma, new_ask_price - best_ask_price, best_ask_price) - net_ask_delta
+            adelta = await self.get_new_delta(net_delta, option_gamma, new_ask_price - best_ask_price) - net_ask_delta
             
-            if adelta * new_ask_price > 25:
+            if adelta * new_ask_price > 50:
                 print("ask ladder", ladder, new_ask_price, adelta * new_ask_price)
                 proposed_asks[new_ask_price] = round(adelta * new_ask_price, 0)
                 net_ask_delta += adelta
