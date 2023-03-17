@@ -39,7 +39,12 @@ class Scalper:
 
     async def get_hedge_delta(self):
         lookup = self.exchange.fetch_balance({'currency': str(self.symbol)})
-        return float(lookup['info']['delta_total_map'][self.hedge_lookup])
+        hedge_lookup = lookup['info']['delta_total_map']
+
+        if self.hedge_lookup in hedge_lookup:
+            return float(hedge_lookup[self.hedge_lookup])
+        else:
+            return 0
 
     async def get_open_orders(self, symbol):
         return self.exchange.fetch_open_orders(symbol)
@@ -136,7 +141,7 @@ class Scalper:
                     post_interval = 0
                 retry_count = 0
             except Exception as e:
-                print("Hedge failed", e.args)
+                print("Hedge failed", e)
                 retry_count += 1
                 if retry_count >= 9:
                     self.done = True
